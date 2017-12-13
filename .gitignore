@@ -1,0 +1,14 @@
+# IDE and build system artifacts
+*.dll
+*.dylib
+*.exe
+*.iml
+*.so
+*.test
+.idea/
+.protoc
+gprobe
+release/
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
