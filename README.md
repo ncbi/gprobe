@@ -33,9 +33,15 @@ Get help
 gprobe -h
 ```
 
-## Building
+## Building from source
 
 Valid _go_ environment is required to build `gprobe` (`go` is in `PATH`, `GOPATH` is set, etc.).
+
+Clone code into valid `GOPATH` location
+
+```bash
+git clone git@github.com:ncbi/gprobe.git $GOPATH/src/github.com/ncbi/gprobe
+```
 
 Build distributable tarballs for all OSes
 
@@ -56,7 +62,7 @@ This project follows git-flow branching model. All development is done off of th
 
 To contribute:
 
-1. Create a feature branch from the latest `develop`, commit your work there
+1. Fork or create a feature branch from the latest `develop`, commit your work there
     ```bash
     git checkout develop
     git pull
