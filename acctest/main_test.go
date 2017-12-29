@@ -37,7 +37,8 @@ import (
 
 var (
 	port        int
-	cert        string
+	caFile      string
+	caPath      string
 	key         string
 	bin         string
 	stubSrvAddr string
@@ -45,6 +46,9 @@ var (
 
 func init() {
 	flag.IntVar(&port, "stub-port", 54321, "port for the stub server")
+	flag.StringVar(&caFile, "stub-cafile", "x509/certificate.pem", "path to the x509 certificate file")
+	flag.StringVar(&caPath, "stub-capath", "x509/", "path to the x509 certificates dir")
+	flag.StringVar(&key, "stub-key", "key.pem", "path to the stub server private key")
 	flag.StringVar(&bin, "gprobe", "../gprobe", "path to the gprobe binary")
 }
 
@@ -151,6 +155,76 @@ func TestShouldFailIfServiceHealthCheckIsNotRegistered(t *testing.T) {
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
 	assert.Contains(t, stderr, "NotFound")
+}
+
+// TLS tests
+
+func TestShouldFailOnTlsVerificationWithSelfSignedCert(t *testing.T) {
+	// given
+	srv, _, err := StartServer(port, caFile, key)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, "--tls", stubSrvAddr)
+
+	// then
+	assert.Equal(t, 127, exitcode)
+	assert.Empty(t, stdout)
+	assert.Contains(t, stderr, "rpc error")
+}
+
+func TestShouldBeAbleToSkipTlsVerification(t *testing.T) {
+	// given
+	srv, _, err := StartServer(port, caFile, key)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, "--tls-insecure", stubSrvAddr)
+
+	// then
+	assert.Equal(t, 0, exitcode)
+	assert.Equal(t, "SERVING\n", stdout)
+	assert.Empty(t, stderr)
+}
+
+func TestShouldBeAbleToSetCustomCAFile(t *testing.T) {
+	// given
+	srv, _, err := StartServer(port, caFile, key)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, "--tls-cafile", caFile, stubSrvAddr)
+
+	// then
+	assert.Equal(t, 0, exitcode)
+	assert.Equal(t, "SERVING\n", stdout)
+	assert.Empty(t, stderr)
+}
+
+func TestShouldBeAbleToSetCustomCAPath(t *testing.T) {
+	// given
+	srv, _, err := StartServer(port, caFile, key)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, "--tls-capath", caPath, stubSrvAddr)
+
+	// then
+	assert.Equal(t, 0, exitcode)
+	assert.Equal(t, "SERVING\n", stdout)
+	assert.Empty(t, stderr)
 }
 
 func runBin(t *testing.T, args ...string) (stdout string, stderr string, exitcode int) {
