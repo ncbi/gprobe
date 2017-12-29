@@ -22,64 +22,48 @@ package acctest
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health"
-	hv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"syscall"
 	"testing"
-	"flag"
+
+	hv1 "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 var (
-	port int
-	listenAddr string
-	bin string
+	port        int
+	cert        string
+	key         string
+	bin         string
+	stubSrvAddr string
 )
-
-func startServer() net.Listener {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	server := health.NewServer()
-	hv1.RegisterHealthServer(grpcServer, server)
-
-	server.SetServingStatus("foo", hv1.HealthCheckResponse_SERVING)
-	server.SetServingStatus("bar", hv1.HealthCheckResponse_NOT_SERVING)
-	go grpcServer.Serve(listener)
-	return listener
-}
 
 func init() {
 	flag.IntVar(&port, "stub-port", 54321, "port for the stub server")
-	flag.StringVar(&bin, "gprobe", "", "path to the gprobe binary")
+	flag.StringVar(&bin, "gprobe", "../gprobe", "path to the gprobe binary")
 }
 
 func TestMain(m *testing.M) {
 	flag.Parse()
-	listenAddr = fmt.Sprintf("%s:%d", "localhost", port)
-
-	lis := startServer()
-	result := 0
-	defer func() {
-		lis.Close()
-		os.Exit(result)
-	}()
-
-	result = m.Run()
+	stubSrvAddr = fmt.Sprintf("%s:%d", "localhost", port)
+	os.Exit(m.Run())
 }
 
 func TestShouldReturnServingForRunningServer(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, listenAddr)
+	// given
+	srv, _, err := StartInsecureServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr)
 
 	assert.Equal(t, 0, exitcode)
 	assert.Equal(t, "SERVING\n", stdout)
@@ -87,40 +71,83 @@ func TestShouldReturnServingForRunningServer(t *testing.T) {
 }
 
 func TestShouldFailIfServerIsNotListening(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, "nosuchhost:1234")
+	// given no server
 
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr)
+
+	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "error", "should print status to STDOUT")
+	assert.Contains(t, stderr, "error")
 }
 
 func TestShouldReturnServingForHealthyService(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, listenAddr, "foo")
+	// given
+	srv, svc, err := StartInsecureServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+	svc.SetServingStatus("foo", hv1.HealthCheckResponse_SERVING)
 
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr, "foo")
+
+	// then
 	assert.Equal(t, 0, exitcode)
 	assert.Equal(t, "SERVING\n", stdout)
 	assert.Empty(t, stderr)
 }
 
 func TestShouldReturnNotServingForUnhealthyService(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, listenAddr, "bar")
+	// given
+	srv, svc, err := StartInsecureServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+	svc.SetServingStatus("foo", hv1.HealthCheckResponse_NOT_SERVING)
 
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr, "foo")
+
+	// then
 	assert.Equal(t, 2, exitcode)
 	assert.Equal(t, "NOT_SERVING\n", stdout)
 	assert.Contains(t, stderr, "health-check failed")
 }
 
 func TestShouldNotFailForUnhealthyServiceIfNoFailIsSet(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, "--no-fail", listenAddr, "bar")
+	// given
+	srv, svc, err := StartInsecureServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+	svc.SetServingStatus("foo", hv1.HealthCheckResponse_NOT_SERVING)
 
+	// when
+	stdout, stderr, exitcode := runBin(t, "--no-fail", stubSrvAddr, "foo")
+
+	// then
 	assert.Equal(t, 0, exitcode)
 	assert.Equal(t, "NOT_SERVING\n", stdout)
 	assert.Empty(t, stderr)
 }
 
 func TestShouldFailIfServiceHealthCheckIsNotRegistered(t *testing.T) {
-	stdout, stderr, exitcode := runBin(t, listenAddr, "non_registered_service")
+	// given
+	srv, _, err := StartInsecureServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
 
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr, "foo")
+
+	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
 	assert.Contains(t, stderr, "NotFound")
@@ -166,5 +193,3 @@ func waitForExitCode(t *testing.T, cmd *exec.Cmd) (exitcode int) {
 	}
 	return
 }
-
-

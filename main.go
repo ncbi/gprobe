@@ -21,14 +21,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"github.com/ncbi/gprobe/probe"
 	"github.com/urfave/cli"
-	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc"
+	hv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"os"
 	"time"
 )
 
+// version variable is set during compilation using ldflags
 var version string
 
 const (
@@ -40,20 +42,26 @@ const (
 	ExitCodeUnexpected = 127
 )
 
-// appInput holds all parsed CLI flags and arguments
-type appInput struct {
+// appFlags holds flags passed to application
+type appFlags struct {
+	timeout time.Duration
+	noFail  bool
+}
+
+// appConfig holds processed application config
+type appConfig struct {
 	timeout       time.Duration
 	noFail        bool
 	serverAddress string
 	serviceName   string
 }
 
-// mainFn holds main application business logic
-type mainFn func(appInput *appInput) *cli.ExitError
+// mainFn is main application business logic
+type mainFn func(config *appConfig) *cli.ExitError
 
 func createApp(mainFn mainFn) *cli.App {
 	app := cli.NewApp()
-	appInput := &appInput{}
+	flags := &appFlags{}
 
 	app.Name = "gprobe"
 	app.Usage = "universal gRPC health-checker. See https://github.com/grpc/grpc/blob/master/doc/health-checking.md"
@@ -71,56 +79,84 @@ func createApp(mainFn mainFn) *cli.App {
 		cli.DurationFlag{
 			Name:        "timeout, t",
 			Usage:       "Operation timeout",
-			Destination: &appInput.timeout,
+			Destination: &flags.timeout,
 			Value:       1 * time.Second,
 		},
 		cli.BoolFlag{
 			Name:        "no-fail, n",
 			Usage:       "Do not fail if service status is other than SERVING. Note: this has no effect on server check",
-			Destination: &appInput.noFail,
+			Destination: &flags.noFail,
 		},
 	}
 	app.Action = func(c *cli.Context) error {
-		switch c.NArg() {
-		case 2:
-			appInput.serviceName = c.Args().Get(1)
-			appInput.serverAddress = c.Args().Get(0)
-			break
-		case 1:
-			appInput.serverAddress = c.Args().Get(0)
-			break
-		default:
-			return c.App.OnUsageError(c, fmt.Errorf("exactly 1 to 2 arguments are required"), false)
+		appConfig, err := createConfig(flags, c.Args())
+		if err != nil {
+			return c.App.OnUsageError(c, err, false)
 		}
 		// Pass all input to mainFn
-		return mainFn(appInput)
+		return mainFn(appConfig)
 	}
-
 	return app
+}
+
+func createConfig(flags *appFlags, args cli.Args) (config *appConfig, err error) {
+	config = &appConfig{}
+	switch len(args) {
+	case 2:
+		config.serviceName = args.Get(1)
+		config.serverAddress = args.Get(0)
+		break
+	case 1:
+		config.serverAddress = args.Get(0)
+		break
+	default:
+		return nil, fmt.Errorf("exactly 1 to 2 arguments are required")
+	}
+	config.timeout = flags.timeout
+	config.noFail = flags.noFail
+	return
 }
 
 func main() {
 	createApp(appMain).Run(os.Args)
 }
 
-func appMain(appInput *appInput) *cli.ExitError {
-	probe.OpTimeout = appInput.timeout
-	err := probe.Connect(appInput.serverAddress)
+func appMain(config *appConfig) *cli.ExitError {
+	ctx, cancel := context.WithTimeout(context.Background(), config.timeout)
+	defer cancel()
+
+	connection, err := connect(ctx, config.serverAddress)
 	if err != nil {
 		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
 	}
-	defer probe.Disconnect()
+	defer connection.Close()
 
-	status, err := probe.CheckService(appInput.serviceName)
+	status, err := check(ctx, connection, config.serviceName)
 	if err != nil {
 		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
 	}
 
 	fmt.Fprintln(os.Stdout, status.String())
-	if !(appInput.noFail || status == grpc_health_v1.HealthCheckResponse_SERVING) {
+	if !(config.noFail || status == hv1.HealthCheckResponse_SERVING) {
 		return cli.NewExitError("health-check failed", ExitCodeHealthCheckNegative)
 	}
 
 	// for some reason returning nil here causes err == nil to be false in urfave/cli/errors.go:79
 	return cli.NewExitError("", 0)
+}
+
+func connect(ctx context.Context, serverAddress string) (connection *grpc.ClientConn, err error) {
+	connection, err = grpc.DialContext(ctx, serverAddress, grpc.WithInsecure())
+	return
+}
+
+func check(ctx context.Context, connection *grpc.ClientConn, service string) (status hv1.HealthCheckResponse_ServingStatus, err error) {
+	client := hv1.NewHealthClient(connection)
+	response, err := client.Check(ctx, &hv1.HealthCheckRequest{
+		Service: service,
+	})
+	if response != nil {
+		status = response.Status
+	}
+	return
 }
