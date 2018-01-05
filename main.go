@@ -22,9 +22,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"github.com/hashicorp/go-rootcerts"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	hv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"os"
 	"time"
@@ -44,8 +47,12 @@ const (
 
 // appFlags holds flags passed to application
 type appFlags struct {
-	timeout time.Duration
-	noFail  bool
+	timeout     time.Duration
+	noFail      bool
+	tls         bool
+	tlsInsecure bool
+	tlsCAFile   string
+	tlsCAPath   string
 }
 
 // appConfig holds processed application config
@@ -54,6 +61,7 @@ type appConfig struct {
 	noFail        bool
 	serverAddress string
 	serviceName   string
+	creds         credentials.TransportCredentials
 }
 
 // mainFn is main application business logic
@@ -87,6 +95,28 @@ func createApp(mainFn mainFn) *cli.App {
 			Usage:       "Do not fail if service status is other than SERVING. Note: this has no effect on server check",
 			Destination: &flags.noFail,
 		},
+		cli.BoolFlag{
+			Name:        "tls",
+			Usage:       "Use TLS, verify server with CA certificates installed on this system",
+			Destination: &flags.tls,
+		},
+		cli.BoolFlag{
+			Name:        "tls-insecure",
+			Usage:       "Use TLS, do NOT verify server (accept any certificate)",
+			Destination: &flags.tlsInsecure,
+		},
+		cli.StringFlag{
+			Name:        "tls-cafile",
+			EnvVar:      "GPROBE_CAFILE",
+			Usage:       "Use TLS, verify server with CA certificate stored in specified file",
+			Destination: &flags.tlsCAFile,
+		},
+		cli.StringFlag{
+			Name:        "tls-capath",
+			EnvVar:      "GPROBE_CAPATH",
+			Usage:       "Use TLS, verify server with CA certificates located under specified path",
+			Destination: &flags.tlsCAPath,
+		},
 	}
 	app.Action = func(c *cli.Context) error {
 		appConfig, err := createConfig(flags, c.Args())
@@ -112,8 +142,73 @@ func createConfig(flags *appFlags, args cli.Args) (config *appConfig, err error)
 	default:
 		return nil, fmt.Errorf("exactly 1 to 2 arguments are required")
 	}
+
+	creds, err := parseCredentials(flags)
+	if err != nil {
+		return nil, err
+	}
+
+	config.creds = creds
 	config.timeout = flags.timeout
 	config.noFail = flags.noFail
+	return
+}
+
+func parseCredentials(flags *appFlags) (credentials.TransportCredentials, error) {
+	// rootcerts library accepts both CAFile and CAPath, however handles only one of two, the other is ignored
+	// to avoid ambiguity in behavior we do additional flags validation and explicitly allow only one flag set
+	switch countTLSFlags(flags) {
+	case 0:
+		// no tls
+		return nil, nil
+	case 1:
+		tlsConfig, err := createTLSConfig(flags.tlsCAFile, flags.tlsCAPath, flags.tlsInsecure)
+		if err != nil {
+			return nil, err
+		}
+		creds := credentials.NewTLS(tlsConfig)
+		return creds, nil
+	default:
+		err := fmt.Errorf("Ambigous TLS configuration. At most one of --tls, --tls-insecure, --tls-cafile and --tls-capath is allowed")
+		return nil, err
+	}
+}
+
+func countTLSFlags(flags *appFlags) int {
+	tlsFlagsSet := 0
+	if flags.tls {
+		tlsFlagsSet++
+	}
+	if flags.tlsInsecure {
+		tlsFlagsSet++
+	}
+	if len(flags.tlsCAFile) > 0 {
+		tlsFlagsSet++
+	}
+	if len(flags.tlsCAPath) > 0 {
+		tlsFlagsSet++
+	}
+	return tlsFlagsSet
+}
+
+func createTLSConfig(caFile string, caPath string, insecure bool) (tlsConfig *tls.Config, err error) {
+	tlsConfig = &tls.Config{}
+
+	if insecure {
+		tlsConfig.InsecureSkipVerify = true
+		return
+	}
+
+	certs := &rootcerts.Config{
+		CAFile: caFile,
+		CAPath: caPath,
+	}
+	err = rootcerts.ConfigureTLS(tlsConfig, certs)
+	if err != nil {
+		tlsConfig = nil
+		return
+	}
+
 	return
 }
 
@@ -125,7 +220,7 @@ func appMain(config *appConfig) *cli.ExitError {
 	ctx, cancel := context.WithTimeout(context.Background(), config.timeout)
 	defer cancel()
 
-	connection, err := connect(ctx, config.serverAddress)
+	connection, err := connect(ctx, config.serverAddress, config.creds)
 	if err != nil {
 		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
 	}
@@ -145,8 +240,14 @@ func appMain(config *appConfig) *cli.ExitError {
 	return cli.NewExitError("", 0)
 }
 
-func connect(ctx context.Context, serverAddress string) (connection *grpc.ClientConn, err error) {
-	connection, err = grpc.DialContext(ctx, serverAddress, grpc.WithInsecure())
+func connect(ctx context.Context, serverAddress string, creds credentials.TransportCredentials) (connection *grpc.ClientConn, err error) {
+	var dialOption grpc.DialOption
+	if creds == nil {
+		dialOption = grpc.WithInsecure()
+	} else {
+		dialOption = grpc.WithTransportCredentials(creds)
+	}
+	connection, err = grpc.DialContext(ctx, serverAddress, dialOption)
 	return
 }
 
