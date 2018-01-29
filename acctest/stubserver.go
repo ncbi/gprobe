@@ -57,3 +57,15 @@ func doStart(port int, options ...grpc.ServerOption) (server *grpc.Server, servi
 	go server.Serve(listener)
 	return server, service, nil
 }
+
+// StartEmptyServer starts gRPC server application with no services
+func StartEmptyServer(port int) (server *grpc.Server, err error) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return
+	}
+	server = grpc.NewServer()
+
+	go server.Serve(listener)
+	return server, nil
+}

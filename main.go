@@ -27,8 +27,10 @@ import (
 	"github.com/hashicorp/go-rootcerts"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	hv1 "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"os"
 	"time"
 )
@@ -145,7 +147,7 @@ func createConfig(flags *appFlags, args cli.Args) (config *appConfig, err error)
 
 	creds, err := parseCredentials(flags)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("can't parse TLS configuration: %s", err.Error())
 	}
 
 	config.creds = creds
@@ -169,7 +171,7 @@ func parseCredentials(flags *appFlags) (credentials.TransportCredentials, error)
 		creds := credentials.NewTLS(tlsConfig)
 		return creds, nil
 	default:
-		err := fmt.Errorf("Ambigous TLS configuration. At most one of --tls, --tls-insecure, --tls-cafile and --tls-capath is allowed")
+		err := fmt.Errorf("at most one of --tls, --tls-insecure, --tls-cafile and --tls-capath is allowed")
 		return nil, err
 	}
 }
@@ -222,7 +224,8 @@ func appMain(config *appConfig) *cli.ExitError {
 
 	connection, err := connect(ctx, config.serverAddress, config.creds)
 	if err != nil {
-		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
+		// actually should never happen because we use non-blocking dialer and failFast RPC (defaults)
+		return cli.NewExitError(fmt.Sprintf("can't connect to application: %s", err.Error()), ExitCodeUnexpected)
 	}
 	defer connection.Close()
 
@@ -256,8 +259,32 @@ func check(ctx context.Context, connection *grpc.ClientConn, service string) (st
 	response, err := client.Check(ctx, &hv1.HealthCheckRequest{
 		Service: service,
 	})
+
 	if response != nil {
 		status = response.Status
 	}
+
+	err = toHumanReadable(err, service)
+
 	return
+}
+
+func toHumanReadable(err error, service string) error {
+	code := status.Code(err)
+	switch code {
+	case codes.OK:
+		return err // err is nil
+	case codes.Unavailable:
+		return fmt.Errorf("connection refused: application isn't listening or TLS handshake failed")
+	case codes.Unimplemented:
+		return fmt.Errorf("rpc error: server doesn't implement gRPC health-checking protocol")
+	case codes.NotFound:
+		return fmt.Errorf("rpc error: unknown service %s", service)
+	default:
+		if s, isRPCError := status.FromError(err); isRPCError {
+			// display only message from generic rpc errors, hide code
+			return fmt.Errorf("rpc error: %s", s.Message())
+		}
+		return err
+	}
 }
