@@ -11,6 +11,7 @@ bin: deps ${BINARY}
 release: release/gprobe-linux-amd64-${VERSION}.tar.gz
 release: release/gprobe-linux-386-${VERSION}.tar.gz
 release: release/gprobe-darwin-amd64-${VERSION}.tar.gz
+release: release/gprobe-windows-amd64-${VERSION}.tar.gz
 
 .PHONY: release-dir
 release-dir:
