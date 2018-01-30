@@ -83,7 +83,7 @@ func TestShouldFailIfServerIsNotListening(t *testing.T) {
 	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "connection refused")
+	assert.Contains(t, stderr, "application isn't listening")
 }
 
 func TestShouldFailIfServerDoesNotImplementHealthCheckProtocol(t *testing.T) {
@@ -190,7 +190,7 @@ func TestShouldFailOnTlsVerificationWithSelfSignedCert(t *testing.T) {
 	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "TLS handshake")
+	assert.Contains(t, stderr, "TLS handshake failed")
 }
 
 func TestShouldBeAbleToSkipTlsVerification(t *testing.T) {
