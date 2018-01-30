@@ -83,7 +83,24 @@ func TestShouldFailIfServerIsNotListening(t *testing.T) {
 	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "error")
+	assert.Contains(t, stderr, "connection refused")
+}
+
+func TestShouldFailIfServerDoesNotImplementHealthCheckProtocol(t *testing.T) {
+	// given
+	srv, err := StartEmptyServer(port)
+	if err != nil {
+		log.Fatalf("can't start stub server: %v", err)
+	}
+	defer srv.GracefulStop()
+
+	// when
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr)
+
+	// then
+	assert.Equal(t, 127, exitcode)
+	assert.Empty(t, stdout)
+	assert.Equal(t, stderr, "rpc error: server doesn't implement gRPC health-checking protocol\n")
 }
 
 func TestShouldReturnServingForHealthyService(t *testing.T) {
@@ -149,12 +166,12 @@ func TestShouldFailIfServiceHealthCheckIsNotRegistered(t *testing.T) {
 	defer srv.GracefulStop()
 
 	// when
-	stdout, stderr, exitcode := runBin(t, stubSrvAddr, "foo")
+	stdout, stderr, exitcode := runBin(t, stubSrvAddr, "my.service.Foo")
 
 	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "NotFound")
+	assert.Equal(t, stderr, "rpc error: unknown service my.service.Foo\n")
 }
 
 // TLS tests
@@ -173,7 +190,7 @@ func TestShouldFailOnTlsVerificationWithSelfSignedCert(t *testing.T) {
 	// then
 	assert.Equal(t, 127, exitcode)
 	assert.Empty(t, stdout)
-	assert.Contains(t, stderr, "rpc error")
+	assert.Contains(t, stderr, "TLS handshake")
 }
 
 func TestShouldBeAbleToSkipTlsVerification(t *testing.T) {
