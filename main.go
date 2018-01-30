@@ -21,14 +21,21 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
-	"github.com/ncbi/gprobe/probe"
+	"github.com/hashicorp/go-rootcerts"
 	"github.com/urfave/cli"
-	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	hv1 "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"os"
 	"time"
 )
 
+// version variable is set during compilation using ldflags
 var version string
 
 const (
@@ -40,20 +47,31 @@ const (
 	ExitCodeUnexpected = 127
 )
 
-// appInput holds all parsed CLI flags and arguments
-type appInput struct {
+// appFlags holds flags passed to application
+type appFlags struct {
+	timeout     time.Duration
+	noFail      bool
+	tls         bool
+	tlsInsecure bool
+	tlsCAFile   string
+	tlsCAPath   string
+}
+
+// appConfig holds processed application config
+type appConfig struct {
 	timeout       time.Duration
 	noFail        bool
 	serverAddress string
 	serviceName   string
+	creds         credentials.TransportCredentials
 }
 
-// mainFn holds main application business logic
-type mainFn func(appInput *appInput) *cli.ExitError
+// mainFn is main application business logic
+type mainFn func(config *appConfig) *cli.ExitError
 
 func createApp(mainFn mainFn) *cli.App {
 	app := cli.NewApp()
-	appInput := &appInput{}
+	flags := &appFlags{}
 
 	app.Name = "gprobe"
 	app.Usage = "universal gRPC health-checker. See https://github.com/grpc/grpc/blob/master/doc/health-checking.md"
@@ -71,56 +89,202 @@ func createApp(mainFn mainFn) *cli.App {
 		cli.DurationFlag{
 			Name:        "timeout, t",
 			Usage:       "Operation timeout",
-			Destination: &appInput.timeout,
+			Destination: &flags.timeout,
 			Value:       1 * time.Second,
 		},
 		cli.BoolFlag{
 			Name:        "no-fail, n",
 			Usage:       "Do not fail if service status is other than SERVING. Note: this has no effect on server check",
-			Destination: &appInput.noFail,
+			Destination: &flags.noFail,
+		},
+		cli.BoolFlag{
+			Name:        "tls",
+			Usage:       "Use TLS, verify server with CA certificates installed on this system",
+			Destination: &flags.tls,
+		},
+		cli.BoolFlag{
+			Name:        "tls-insecure",
+			Usage:       "Use TLS, do NOT verify server (accept any certificate)",
+			Destination: &flags.tlsInsecure,
+		},
+		cli.StringFlag{
+			Name:        "tls-cafile",
+			EnvVar:      "GPROBE_CAFILE",
+			Usage:       "Use TLS, verify server with CA certificate stored in specified file",
+			Destination: &flags.tlsCAFile,
+		},
+		cli.StringFlag{
+			Name:        "tls-capath",
+			EnvVar:      "GPROBE_CAPATH",
+			Usage:       "Use TLS, verify server with CA certificates located under specified path",
+			Destination: &flags.tlsCAPath,
 		},
 	}
 	app.Action = func(c *cli.Context) error {
-		switch c.NArg() {
-		case 2:
-			appInput.serviceName = c.Args().Get(1)
-			appInput.serverAddress = c.Args().Get(0)
-			break
-		case 1:
-			appInput.serverAddress = c.Args().Get(0)
-			break
-		default:
-			return c.App.OnUsageError(c, fmt.Errorf("exactly 1 to 2 arguments are required"), false)
+		appConfig, err := createConfig(flags, c.Args())
+		if err != nil {
+			return c.App.OnUsageError(c, err, false)
 		}
 		// Pass all input to mainFn
-		return mainFn(appInput)
+		return mainFn(appConfig)
+	}
+	return app
+}
+
+func createConfig(flags *appFlags, args cli.Args) (config *appConfig, err error) {
+	config = &appConfig{}
+	switch len(args) {
+	case 2:
+		config.serviceName = args.Get(1)
+		config.serverAddress = args.Get(0)
+		break
+	case 1:
+		config.serverAddress = args.Get(0)
+		break
+	default:
+		return nil, fmt.Errorf("exactly 1 to 2 arguments are required")
 	}
 
-	return app
+	creds, err := parseCredentials(flags)
+	if err != nil {
+		return nil, fmt.Errorf("can't parse TLS configuration: %s", err.Error())
+	}
+
+	config.creds = creds
+	config.timeout = flags.timeout
+	config.noFail = flags.noFail
+	return
+}
+
+func parseCredentials(flags *appFlags) (credentials.TransportCredentials, error) {
+	// rootcerts library accepts both CAFile and CAPath, however handles only one of two, the other is ignored
+	// to avoid ambiguity in behavior we do additional flags validation and explicitly allow only one flag set
+	switch countTLSFlags(flags) {
+	case 0:
+		// no tls
+		return nil, nil
+	case 1:
+		tlsConfig, err := createTLSConfig(flags.tlsCAFile, flags.tlsCAPath, flags.tlsInsecure)
+		if err != nil {
+			return nil, err
+		}
+		creds := credentials.NewTLS(tlsConfig)
+		return creds, nil
+	default:
+		err := fmt.Errorf("at most one of --tls, --tls-insecure, --tls-cafile and --tls-capath is allowed")
+		return nil, err
+	}
+}
+
+func countTLSFlags(flags *appFlags) int {
+	tlsFlagsSet := 0
+	if flags.tls {
+		tlsFlagsSet++
+	}
+	if flags.tlsInsecure {
+		tlsFlagsSet++
+	}
+	if len(flags.tlsCAFile) > 0 {
+		tlsFlagsSet++
+	}
+	if len(flags.tlsCAPath) > 0 {
+		tlsFlagsSet++
+	}
+	return tlsFlagsSet
+}
+
+func createTLSConfig(caFile string, caPath string, insecure bool) (tlsConfig *tls.Config, err error) {
+	tlsConfig = &tls.Config{}
+
+	if insecure {
+		tlsConfig.InsecureSkipVerify = true
+		return
+	}
+
+	certs := &rootcerts.Config{
+		CAFile: caFile,
+		CAPath: caPath,
+	}
+	err = rootcerts.ConfigureTLS(tlsConfig, certs)
+	if err != nil {
+		tlsConfig = nil
+		return
+	}
+
+	return
 }
 
 func main() {
 	createApp(appMain).Run(os.Args)
 }
 
-func appMain(appInput *appInput) *cli.ExitError {
-	probe.OpTimeout = appInput.timeout
-	err := probe.Connect(appInput.serverAddress)
-	if err != nil {
-		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
-	}
-	defer probe.Disconnect()
+func appMain(config *appConfig) *cli.ExitError {
+	ctx, cancel := context.WithTimeout(context.Background(), config.timeout)
+	defer cancel()
 
-	status, err := probe.CheckService(appInput.serviceName)
+	connection, err := connect(ctx, config.serverAddress, config.creds)
+	if err != nil {
+		// actually should never happen because we use non-blocking dialer and failFast RPC (defaults)
+		return cli.NewExitError(fmt.Sprintf("can't connect to application: %s", err.Error()), ExitCodeUnexpected)
+	}
+	defer connection.Close()
+
+	status, err := check(ctx, connection, config.serviceName)
 	if err != nil {
 		return cli.NewExitError(err.Error(), ExitCodeUnexpected)
 	}
 
 	fmt.Fprintln(os.Stdout, status.String())
-	if !(appInput.noFail || status == grpc_health_v1.HealthCheckResponse_SERVING) {
+	if !(config.noFail || status == hv1.HealthCheckResponse_SERVING) {
 		return cli.NewExitError("health-check failed", ExitCodeHealthCheckNegative)
 	}
 
 	// for some reason returning nil here causes err == nil to be false in urfave/cli/errors.go:79
 	return cli.NewExitError("", 0)
+}
+
+func connect(ctx context.Context, serverAddress string, creds credentials.TransportCredentials) (connection *grpc.ClientConn, err error) {
+	var dialOption grpc.DialOption
+	if creds == nil {
+		dialOption = grpc.WithInsecure()
+	} else {
+		dialOption = grpc.WithTransportCredentials(creds)
+	}
+	connection, err = grpc.DialContext(ctx, serverAddress, dialOption)
+	return
+}
+
+func check(ctx context.Context, connection *grpc.ClientConn, service string) (status hv1.HealthCheckResponse_ServingStatus, err error) {
+	client := hv1.NewHealthClient(connection)
+	response, err := client.Check(ctx, &hv1.HealthCheckRequest{
+		Service: service,
+	})
+
+	if response != nil {
+		status = response.Status
+	}
+
+	err = toHumanReadable(err, service)
+
+	return
+}
+
+func toHumanReadable(err error, service string) error {
+	code := status.Code(err)
+	switch code {
+	case codes.OK:
+		return err // err is nil
+	case codes.Unavailable:
+		return fmt.Errorf("connection refused: application isn't listening or TLS handshake failed")
+	case codes.Unimplemented:
+		return fmt.Errorf("rpc error: server doesn't implement gRPC health-checking protocol")
+	case codes.NotFound:
+		return fmt.Errorf("rpc error: unknown service %s", service)
+	default:
+		if s, isRPCError := status.FromError(err); isRPCError {
+			// display only message from generic rpc errors, hide code
+			return fmt.Errorf("rpc error: %s", s.Message())
+		}
+		return err
+	}
 }
